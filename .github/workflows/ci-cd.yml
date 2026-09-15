@@ -1,0 +1,147 @@
+name: CI/CD · Lambda de Autenticacao
+
+on:
+  push:
+    branches: [main, homolog]
+    paths-ignore: ['**.md']
+  pull_request:
+    branches: [main, homolog]
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: 'Executar terraform destroy em vez de apply'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.9.8
+  NODE_VERSION: 22
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  qualidade:
+    name: Lint, testes e build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Testes com cobertura
+        run: pnpm test:cov
+
+      - name: Empacotar as funcoes
+        run: pnpm package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambdas
+          path: build/*.zip
+          retention-days: 1
+
+  terraform:
+    name: Validar Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - run: terraform fmt -check -recursive
+        working-directory: infra
+
+      - run: terraform init -backend=false
+        working-directory: infra
+
+      - run: terraform validate
+        working-directory: infra
+
+  deploy:
+    name: Deploy
+    needs: [qualidade, terraform]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: ${{ github.ref_name == 'main' && 'producao' || 'homologacao' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lambdas
+          path: build
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - run: terraform init -input=false
+        working-directory: infra
+
+      - name: Apply
+        if: ${{ !inputs.destroy }}
+        run: terraform apply -input=false -auto-approve
+        working-directory: infra
+
+      - name: Destroy
+        if: ${{ inputs.destroy }}
+        run: terraform destroy -input=false -auto-approve
+        working-directory: infra
+
+      - name: Smoke test do authorizer
+        if: ${{ !inputs.destroy }}
+        working-directory: infra
+        run: |
+          FN=$(terraform output -raw authorizer_function_arn)
+          cat > /tmp/evento.json <<'JSON'
+          {
+            "version": "2.0",
+            "type": "REQUEST",
+            "routeKey": "GET /api/clientes",
+            "headers": { "authorization": "Bearer token-invalido" },
+            "requestContext": { "requestId": "smoke-test" }
+          }
+          JSON
+          aws lambda invoke --function-name "$FN" \
+            --cli-binary-format raw-in-base64-out \
+            --payload file:///tmp/evento.json /tmp/resposta.json
+          cat /tmp/resposta.json
+          # Um token invalido precisa ser recusado; o contrario indica falha grave.
+          grep -q '"isAuthorized":false' /tmp/resposta.json
+
+      - name: Publicar os ARNs
+        if: ${{ !inputs.destroy }}
+        working-directory: infra
+        run: |
+          {
+            echo "### Funcoes publicadas"
+            echo '```bash'
+            echo "lambda_token_arn      = $(terraform output -raw token_function_arn)"
+            echo "lambda_authorizer_arn = $(terraform output -raw authorizer_function_arn)"
+            echo '```'
+            echo "Informe estes valores no repositorio \`oficina-infra-k8s\`."
+          } >> $GITHUB_STEP_SUMMARY
