@@ -118,7 +118,8 @@ resource "aws_lambda_function" "token" {
   timeout     = 20
 
   vpc_config {
-    subnet_ids         = local.subnet_ids
+    # As mesmas subnets do VPC endpoint do Secrets Manager.
+    subnet_ids         = local.endpoint_subnet_ids
     security_group_ids = [aws_security_group.lambda.id]
   }
 
@@ -161,4 +162,55 @@ resource "aws_lambda_function" "authorizer" {
   }
 
   depends_on = [aws_cloudwatch_log_group.authorizer]
+}
+
+# ---------------------------------------------------------------------------
+# Acesso ao Secrets Manager a partir da VPC
+#
+# A funcao de token roda dentro da VPC para alcancar o RDS, e ENIs de Lambda
+# nao recebem IP publico. Sem NAT Gateway — deliberadamente evitado por custo —
+# nao ha rota para os endpoints publicos da AWS, e a chamada ao Secrets Manager
+# fica pendurada ate o timeout.
+#
+# Um VPC endpoint de interface resolve o nome regional do servico para IPs
+# privados dentro da VPC, custando ~US$ 0,01/h por AZ contra ~US$ 0,045/h de um
+# NAT Gateway.
+# ---------------------------------------------------------------------------
+locals {
+  # O endpoint e a funcao compartilham as mesmas duas subnets: o trafego nao
+  # precisa atravessar AZ para alcancar a interface.
+  endpoint_subnet_ids = slice(local.subnet_ids, 0, 2)
+}
+
+resource "aws_security_group" "vpc_endpoint" {
+  name        = "${var.project}-secretsmanager-endpoint-sg"
+  description = "VPC endpoint do Secrets Manager"
+  vpc_id      = data.aws_vpc.default.id
+
+  tags = {
+    Name = "${var.project}-secretsmanager-endpoint-sg"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "endpoint_from_lambda" {
+  security_group_id            = aws_security_group.vpc_endpoint.id
+  description                  = "HTTPS a partir das funcoes de autenticacao"
+  referenced_security_group_id = aws_security_group.lambda.id
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_endpoint" "secretsmanager" {
+  vpc_id            = data.aws_vpc.default.id
+  service_name      = "com.amazonaws.${var.region}.secretsmanager"
+  vpc_endpoint_type = "Interface"
+
+  subnet_ids          = local.endpoint_subnet_ids
+  security_group_ids  = [aws_security_group.vpc_endpoint.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "${var.project}-secretsmanager-endpoint"
+  }
 }
